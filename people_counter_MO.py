@@ -103,7 +103,7 @@ def people_counter():
             if totalFrames % args["skip_frames"] == 0:
                 status = "Detecting"
                 trackers = []
-                blob = cv2.dnn.blobFromImage(frame, 0.007843, (W, H), 127.5)
+                blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
                 net.setInput(blob)
                 detections = net.forward()
 
@@ -157,11 +157,13 @@ def people_counter():
                         # Вверх (Выход)
                         if direction < 0 and centroid[1] < H // 2:
                             totalUp += 1
+                            print("+1")
                             move_out.append(totalUp)
                             out_time.append(datetime.datetime.now().strftime("%H:%M:%S"))
                             to.counted = True
                         # Вниз (Вход)
                         elif direction > 0 and centroid[1] > H // 2:
+                            print("-1")
                             totalDown += 1
                             move_in.append(totalDown)
                             in_time.append(datetime.datetime.now().strftime("%H:%M:%S"))
@@ -180,10 +182,10 @@ def people_counter():
 
             # Отрисовка инфо
             current_inside = len(move_in) - len(move_out)
-            cv2.putText(frame, f"In: {totalDown} | Out: {totalUp}", (10, 20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.putText(frame, f"Inside: {current_inside}", (10, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # cv2.putText(frame, f"In: {totalDown} | Out: {totalUp}", (10, 20), 
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            # cv2.putText(frame, f"Inside: {current_inside}", (10, 50), 
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             if writer is not None:
                 writer.write(frame)

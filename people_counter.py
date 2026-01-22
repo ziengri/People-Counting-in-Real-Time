@@ -162,7 +162,7 @@ def people_counter():
 
 			# convert the frame to a blob and pass the blob through the
 			# network and obtain the detections
-			blob = cv2.dnn.blobFromImage(frame, 0.007843, (W, H), 127.5)
+			blob = cv2.dnn.blobFromImage(frame, 0.007843, (300,300), 127.5)
 			net.setInput(blob)
 			detections = net.forward()
 
@@ -259,6 +259,7 @@ def people_counter():
 					# is moving up) AND the centroid is above the center
 					# line, count the object
 					if direction < 0 and centroid[1] < H // 2:
+						print("+1")
 						totalUp += 1
 						date_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 						move_out.append(totalUp)
@@ -269,6 +270,7 @@ def people_counter():
 					# is moving down) AND the centroid is below the
 					# center line, count the object
 					elif direction > 0 and centroid[1] > H // 2:
+						print("-1")
 						totalDown += 1
 						date_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 						move_in.append(totalDown)
@@ -326,12 +328,12 @@ def people_counter():
 		if writer is not None:
 			writer.write(frame)
 
-		# show the output frame
-		cv2.imshow("Real-Time Monitoring/Analysis Window", frame)
-		key = cv2.waitKey(1) & 0xFF
-		# if the `q` key was pressed, break from the loop
-		if key == ord("q"):
-			break
+		# # show the output frame
+		# cv2.imshow("Real-Time Monitoring/Analysis Window", frame)
+		# key = cv2.waitKey(1) & 0xFF
+		# # if the `q` key was pressed, break from the loop
+		# if key == ord("q"):
+		# 	break
 		# increment the total number of frames processed thus far and
 		# then update the FPS counter
 		totalFrames += 1
