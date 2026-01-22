@@ -40,31 +40,17 @@ class CentroidTracker:
 		# check to see if the list of input bounding box rectangles
 		# is empty
 		if len(rects) == 0:
-			# loop over any existing tracked objects and mark them
-			# as disappeared
-			for objectID in list(self.disappeared.keys()):
-				self.disappeared[objectID] += 1
+				for objectID in list(self.disappeared.keys()):
+					self.disappeared[objectID] += 1
+					if self.disappeared[objectID] > self.maxDisappeared:
+						self.deregister(objectID)
+				return self.objects
 
-				# if we have reached a maximum number of consecutive
-				# frames where a given object has been marked as
-				# missing, deregister it
-				if self.disappeared[objectID] > self.maxDisappeared:
-					self.deregister(objectID)
-
-			# return early as there are no centroids or tracking info
-			# to update
-			return self.objects
-
-		# initialize an array of input centroids for the current frame
+		# Быстрое вычисление центроидов через NumPy
+		rects = np.array(rects)
 		inputCentroids = np.zeros((len(rects), 2), dtype="int")
-
-		# loop over the bounding box rectangles
-		for (i, (startX, startY, endX, endY)) in enumerate(rects):
-			# use the bounding box coordinates to derive the centroid
-			cX = int((startX + endX) / 2.0)
-			cY = int((startY + endY) / 2.0)
-			inputCentroids[i] = (cX, cY)
-
+		inputCentroids[:, 0] = (rects[:, 0] + rects[:, 2]) // 2
+		inputCentroids[:, 1] = (rects[:, 1] + rects[:, 3]) // 2
 		# if we are currently not tracking any objects take the input
 		# centroids and register each of them
 		if len(self.objects) == 0:
@@ -77,13 +63,13 @@ class CentroidTracker:
 		else:
 			# grab the set of object IDs and corresponding centroids
 			objectIDs = list(self.objects.keys())
-			objectCentroids = list(self.objects.values())
+			objectCentroids = np.array(list(self.objects.values()))
 
 			# compute the distance between each pair of object
 			# centroids and input centroids, respectively -- our
 			# goal will be to match an input centroid to an existing
 			# object centroid
-			D = dist.cdist(np.array(objectCentroids), inputCentroids)
+			D = dist.cdist(objectCentroids, inputCentroids)
 
 			# in order to perform this matching we must (1) find the
 			# smallest value in each row and then (2) sort the row
