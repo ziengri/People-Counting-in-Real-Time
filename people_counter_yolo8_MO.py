@@ -142,7 +142,7 @@ def people_counter():
                     rects.append((x, y, x + w, y + h))
 
         # Линия подсчета (горизонтальная по центру)
-        # cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
+        cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
         objects = ct.update(rects)
 
         for (objectID, centroid) in objects.items():
@@ -176,27 +176,27 @@ def people_counter():
                         to.counted = True
 
             trackableObjects[objectID] = to
-            # cv2.putText(frame, f"ID {objectID}", (centroid[0]-10, centroid[1]-10), 
-            #             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            # cv2.circle(frame, (centroid[0], centroid[1]), 3, (255, 255, 255), -1)
+            cv2.putText(frame, f"ID {objectID}", (centroid[0]-10, centroid[1]-10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.circle(frame, (centroid[0], centroid[1]), 3, (255, 255, 255), -1)
 
         # Отрисовка инфо
         total_inside = len(move_in) - len(move_out)
-        # cv2.putText(frame, f"In: {totalDown}  Out: {totalUp}", (10, 20), 
-        #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        # cv2.putText(frame, f"Inside: {total_inside}", (10, 40), 
-        #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        # cv2.putText(frame, f"Status: {status}", (10, H - 10), 
-        #             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+        cv2.putText(frame, f"In: {totalDown}  Out: {totalUp}", (10, 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f"Inside: {total_inside}", (10, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Status: {status}", (10, H - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
         if config["Log"]:
             log_data(move_in, in_time, move_out, out_time)
         if writer is not None:
             writer.write(frame)
 
-        # cv2.imshow("Bus Counter YOLOv8", frame)
-        # if cv2.waitKey(1) & 0xFF == ord("q"):
-        #     break
+        cv2.imshow("Bus Counter YOLOv8", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
         totalFrames += 1
         fps.update()

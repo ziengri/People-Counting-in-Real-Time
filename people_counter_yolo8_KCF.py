@@ -21,6 +21,8 @@ def people_counter():
     ap.add_argument("-i", "--input", type=str, help="path to video file")
     ap.add_argument("-c", "--confidence", type=float, default=0.3)
     ap.add_argument("-s", "--skip-frames", type=int, default=10)
+    ap.add_argument("-d", "--debug", type=bool, default=False)
+
     args = vars(ap.parse_args())
 
     # 1. Загрузка YOLOv8 через ONNX Runtime
@@ -38,7 +40,7 @@ def people_counter():
             return
 
     W, H = None, None
-    ct = CentroidTracker(maxDisappeared=60, maxDistance=70)
+    ct = CentroidTracker(maxDisappeared=70, maxDistance=80)
     trackers = []
     trackableObjects = {}
     totalFrames = 0
@@ -129,16 +131,17 @@ def people_counter():
                         to.counted = True
 
             trackableObjects[objectID] = to
-            # cv2.circle(frame, (centroid[0], centroid[1]), 4, (255, 255, 255), -1)
+            cv2.circle(frame, (centroid[0], centroid[1]), 4, (255, 255, 255), -1)
 
         # Отрисовка
-        # cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
-        # cv2.putText(frame, f"In: {totalDown} Out: {totalUp}", (10, 25), 
-        #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        if args["debug"]==True:
+            cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
+            cv2.putText(frame, f"In: {totalDown} Out: {totalUp}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # cv2.imshow("KCF + YOLOv8", frame)
-        # if cv2.waitKey(1) & 0xFF == ord("q"):
-        #     break
+        if args["debug"]==True: 
+            cv2.imshow("KCF + YOLOv8", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
         totalFrames += 1
         fps.update()
@@ -146,7 +149,7 @@ def people_counter():
     fps.stop()
     if fps.elapsed() > 0:
         print(f"[INFO] FPS: {fps.fps():.2f}")
-    # cv2.destroyAllWindows()
+    if args["debug"]==True:cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     people_counter()

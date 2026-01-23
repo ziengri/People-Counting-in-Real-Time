@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # Загружаем выбранную модель
-model = YOLO("yolov8n.pt") 
+model = YOLO("./detector/yolo12n.pt") 
 
 # Экспортируем с оптимизацией под CPU
 model.export(
