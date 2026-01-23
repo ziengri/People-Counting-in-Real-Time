@@ -68,7 +68,7 @@ def people_counter():
     writer = None
     W, H = None, None
 
-    ct = CentroidTracker(maxDisappeared=40, maxDistance=50)
+    ct = CentroidTracker(maxDisappeared=60, maxDistance=70)
     trackers = []
     trackableObjects = {}
 
@@ -141,7 +141,7 @@ def people_counter():
                         (x, y, w, h) = [int(v) for v in box]
                         rects.append((x, y, x + w, y + h))
 
-            cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
+            # cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
             objects = ct.update(rects)
 
             for (objectID, centroid) in objects.items():
@@ -176,9 +176,9 @@ def people_counter():
                             to.counted = True
 
                 trackableObjects[objectID] = to
-                cv2.putText(frame, f"ID {objectID}", (centroid[0]-10, centroid[1]-10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                cv2.circle(frame, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
+                # cv2.putText(frame, f"ID {objectID}", (centroid[0]-10, centroid[1]-10), 
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # cv2.circle(frame, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
 
             # Отрисовка инфо
             current_inside = len(move_in) - len(move_out)
@@ -213,7 +213,7 @@ def people_counter():
             vs.stop()
         else:
             vs.release()
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     people_counter()
