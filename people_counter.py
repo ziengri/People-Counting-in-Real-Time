@@ -329,11 +329,11 @@ def people_counter():
 			writer.write(frame)
 
 		# # show the output frame
-		# cv2.imshow("Real-Time Monitoring/Analysis Window", frame)
-		# key = cv2.waitKey(1) & 0xFF
+		cv2.imshow("Real-Time Monitoring/Analysis Window", frame)
+		key = cv2.waitKey(1) & 0xFF
 		# # if the `q` key was pressed, break from the loop
-		# if key == ord("q"):
-		# 	break
+		if key == ord("q"):
+			break
 		# increment the total number of frames processed thus far and
 		# then update the FPS counter
 		totalFrames += 1
