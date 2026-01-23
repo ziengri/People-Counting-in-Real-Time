@@ -1,3 +1,4 @@
+
 from tracker.centroidtracker import CentroidTracker
 from tracker.trackableobject import TrackableObject
 from imutils.video import VideoStream
@@ -9,6 +10,15 @@ import datetime
 import imutils
 import time
 import json
+import os
+
+
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-d", "--debug", type=bool, default=False)
+if args["debug"]==False:os.environ["QT_QPA_PLATFORM"] = "offscreen" # Запрещает QT искать монитор
+
+
 import cv2
 
 # Инициализация конфигурации
