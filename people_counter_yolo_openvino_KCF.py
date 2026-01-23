@@ -11,14 +11,6 @@ import imutils
 import time
 import json
 import os
-
-
-
-ap = argparse.ArgumentParser()
-ap.add_argument("-d", "--debug", type=bool, default=False)
-if args["debug"]==False:os.environ["QT_QPA_PLATFORM"] = "offscreen" # Запрещает QT искать монитор
-
-
 import cv2
 
 # Инициализация конфигурации
@@ -40,7 +32,12 @@ def people_counter():
     print("[INFO] Загрузка модели OpenVINO...")
     core = ov.Core()
     model_ov = core.read_model(model=args["model"])
-    compiled_model = core.compile_model(model_ov, "CPU")
+    compiled_model = core.compile_model(
+        model_ov, "CPU",
+        {
+            "PERFORMANCE_HINT": "THROUGHPUT",
+        }
+    )    
     output_layer = compiled_model.output(0)
 
     # 2. Запуск видеопотока
@@ -63,14 +60,21 @@ def people_counter():
 
     fps = FPS().start()
 
+    inp = np.empty((1, 3, 320, 320), dtype=np.float32)
     while True:
         frame = vs.read()
         frame = frame[1] if args.get("input", False) else frame
         if frame is None:
             break
 
-        # Оптимизация размера
+        # Оптимизация размера old
         frame = imutils.resize(frame, width=320)
+        if W is None:
+            h0, w0 = frame.shape[:2]
+            scale = 320 / w0
+            new_size = (320, int(h0 * scale))
+
+        frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_LINEAR)
         if W is None or H is None:
             (H, W) = frame.shape[:2]
 
@@ -80,13 +84,20 @@ def people_counter():
         if totalFrames % args["skip_frames"] == 0:
             trackers = []
             
-            # Подготовка кадра (BCHW, 320x320, Float32)
-            blob = cv2.resize(frame, (320, 320))
-            blob = blob.transpose(2, 0, 1) # HWC -> CHW
-            blob = blob.reshape(1, 3, 320, 320).astype(np.float32) / 255.0
+            # Подготовка кадра (BCHW, 320x320, Float32) Старый код
+            # blob = cv2.resize(frame, (320, 320))
+            # blob = blob.transpose(2, 0, 1) # HWC -> CHW
+            # blob = blob.reshape(1, 3, 320, 320).astype(np.float32) / 255.0
+
+            # Подготовка кадра новый код
+            img = cv2.resize(frame, (320, 320), interpolation=cv2.INTER_LINEAR)
+            img = img.transpose(2, 0, 1)  # HWC -> CHW
+
+            # Заполняем уже выделенный буфер inp (без astype и без новых массивов)
+            np.multiply(img, 1.0/255.0, out=inp[0], casting="unsafe")
 
             # Инференс OpenVINO
-            results = compiled_model([blob])[output_layer]
+            results = compiled_model([inp])[output_layer]
             outputs = np.squeeze(results).T # Формат (2100, 84) для YOLO12
 
             boxes, confs = [], []
@@ -106,11 +117,12 @@ def people_counter():
             if len(indices) > 0:
                 for i in indices.flatten():
                     (x, y, w, h) = boxes[i]
-                    try:
-                        tracker = cv2.TrackerKCF_create()
-                    except AttributeError:
-                        tracker = cv2.legacy.TrackerKCF_create()
-                    
+
+                    # ВАЖНО: rects для CentroidTracker на кадре детекции
+                    rects.append((x, y, x + w, y + h))
+
+                    # трекер как и было
+                    tracker = cv2.TrackerKCF_create() if hasattr(cv2, "TrackerKCF_create") else cv2.legacy.TrackerKCF_create()
                     tracker.init(frame, (x, y, w, h))
                     trackers.append(tracker)
         
