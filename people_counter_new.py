@@ -2,7 +2,6 @@ import argparse
 import json
 import time
 from dataclasses import dataclass
-from collections import OrderedDict, deque
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -11,8 +10,6 @@ import openvino as ov
 from imutils.video import VideoStream, FPS
 from tracker.centroidtracker import CentroidTracker
 from tracker.trackableobject import TrackableObject
-from scipy.spatial import distance as dist
-from scipy.optimize import linear_sum_assignment
 
 
 # -----------------------------
@@ -71,7 +68,6 @@ class Bench:
         return f"{prefix} n={self.trk_n} | " + self._fmt(avg)
 
 
-
 # -----------------------------
 # App config
 # -----------------------------
@@ -87,6 +83,8 @@ class AppArgs:
     bench_warmup: int
     bench_every: int
     nms_topk: int
+    kalman_q: float
+    kalman_r: float
 
 
 def parse_args() -> AppArgs:
@@ -103,6 +101,10 @@ def parse_args() -> AppArgs:
     ap.add_argument("--bench-every", type=int, default=200, help="print benchmark every N frames after warmup")
     ap.add_argument("--nms-topk", type=int, default=200, help="limit candidates before NMS (0=off)")
 
+    # Kalman tuning
+    ap.add_argument("--kalman-q", type=float, default=1e-2, help="Kalman process noise scale (higher=more dynamic)")
+    ap.add_argument("--kalman-r", type=float, default=1e-1, help="Kalman measurement noise scale (higher=more smoothing)")
+
     a = ap.parse_args()
     return AppArgs(
         model=a.model,
@@ -115,6 +117,8 @@ def parse_args() -> AppArgs:
         bench_warmup=a.bench_warmup,
         bench_every=a.bench_every,
         nms_topk=a.nms_topk,
+        kalman_q=a.kalman_q,
+        kalman_r=a.kalman_r,
     )
 
 
@@ -159,7 +163,6 @@ class StreamVideoSource(VideoSource):
         return self.vs.read()
 
     def release(self) -> None:
-        # VideoStream не всегда имеет release(), но stop() есть
         try:
             self.vs.stop()
         except Exception:
@@ -195,18 +198,15 @@ class OpenVINODetector:
 
         self.inp = np.empty((1, 3, 320, 320), dtype=np.float32)
 
-    def preprocess(self, frame: np.ndarray) -> float:
+    def preprocess(self, frame_320w: np.ndarray) -> float:
+        """
+        frame_320w: кадр после FrameResizer (ширина 320, высота H), BGR uint8
+        Здесь мы готовим 320x320 для модели.
+        """
         t0 = time.perf_counter()
-        img = cv2.resize(frame, (320, 320), interpolation=cv2.INTER_LINEAR)
-        img = img.transpose(2, 0, 1)
+        img = cv2.resize(frame_320w, (320, 320), interpolation=cv2.INTER_LINEAR)
+        img = img.transpose(2, 0, 1)  # CHW
         self.inp[0] = img.astype(np.float32) * (1.0 / 255.0)
-        # self.inp = cv2.dnn.blobFromImage(
-        #     frame,
-        #     scalefactor=1/255.0,
-        #     size=(320, 320),
-        #     swapRB=False,
-        #     crop=False
-        # )  # float32 NCHW, shape (1,3,320,320)
         t1 = time.perf_counter()
         return (t1 - t0) * 1000.0
 
@@ -220,7 +220,7 @@ class OpenVINODetector:
                     conf_th: float, nms_topk: int, nms_iou: float = 0.45) -> Tuple[List[Tuple[int, int, int, int]], float]:
         t0 = time.perf_counter()
 
-        outputs = np.squeeze(results).T  # (2100, 84)
+        outputs = np.squeeze(results).T  # (N, 84)
         sx = (W / 320.0)
         sy = (H / 320.0)
 
@@ -265,9 +265,9 @@ class OpenVINODetector:
 # KCF tracker manager
 # -----------------------------
 def create_kcf_tracker():
-    if hasattr(cv2, "TrackerKCF_create"):
-        return cv2.TrackerKCF_create()
-    return cv2.legacy.TrackerKCF_create()
+    if hasattr(cv2, "TrackerMOSSE_create"):
+        return cv2.TrackerMOSSE_create()()
+    return cv2.legacy.TrackerMOSSE_create()
 
 
 class KCFTrackerManager:
@@ -303,29 +303,99 @@ class KCFTrackerManager:
 
 
 # -----------------------------
-# Counting logic wrapper
+# Kalman helpers
+# -----------------------------
+def make_kalman_xy(x: float, y: float, q: float, r: float) -> cv2.KalmanFilter:
+    # state: [x, y, vx, vy], measurement: [x, y]
+    kf = cv2.KalmanFilter(4, 2)
+
+    kf.transitionMatrix = np.array([
+        [1, 0, 1, 0],
+        [0, 1, 0, 1],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1],
+    ], dtype=np.float32)
+
+    kf.measurementMatrix = np.array([
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+    ], dtype=np.float32)
+
+    kf.processNoiseCov = np.eye(4, dtype=np.float32) * float(q)
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * float(r)
+    kf.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
+
+    kf.statePost = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
+    return kf
+
+
+def kalman_step(kf: cv2.KalmanFilter, meas_xy: Tuple[int, int], meas_valid: bool) -> Tuple[int, int]:
+    pred = kf.predict()  # 4x1
+    if meas_valid:
+        mx, my = meas_xy
+        z = np.array([[np.float32(mx)], [np.float32(my)]], dtype=np.float32)
+        kf.correct(z)
+        x = float(kf.statePost[0, 0])
+        y = float(kf.statePost[1, 0])
+    else:
+        x = float(pred[0, 0])
+        y = float(pred[1, 0])
+
+    return int(round(x)), int(round(y))
+
+
+# -----------------------------
+# Counting logic wrapper (+ Kalman per object)
 # -----------------------------
 class PeopleCounter:
-    def __init__(self, maxDisappeared=90, maxDistance=100):
+    def __init__(self, maxDisappeared=90, maxDistance=100, kalman_q: float = 1e-2, kalman_r: float = 1e-1):
         self.ct = CentroidTracker(maxDisappeared=maxDisappeared, maxDistance=maxDistance)
         self.trackableObjects: Dict[int, TrackableObject] = {}
         self.totalDown = 0
         self.totalUp = 0
 
-    def update(self, rects: List[Tuple[int, int, int, int]], H: int, W: int,
-               debug: int = 0, frame: Optional[np.ndarray] = None) -> Tuple[float, Dict[int, Tuple[int, int]]]:
+        self.kalman_q = kalman_q
+        self.kalman_r = kalman_r
+        self.kalmans: Dict[int, cv2.KalmanFilter] = {}
+
+    def update(self,
+               rects: List[Tuple[int, int, int, int]],
+               H: int,
+               W: int,
+               inputs_fresh: bool,
+               debug: int = 0,
+               frame: Optional[np.ndarray] = None) -> Tuple[float, Dict[int, Tuple[int, int]]]:
+        """
+        inputs_fresh:
+          True  -> rects реально обновлены (det кадр или kcf update кадр)
+          False -> rects = last_rects (мы НЕ хотим делать correct() каждый кадр одним и тем же измерением)
+        """
         t0 = time.perf_counter()
         objects = self.ct.update(rects)
-
         line_y = H // 2
 
-        for (objectID, centroid) in objects.items():
-            to = self.trackableObjects.get(objectID, None)
+        # Чистим калманы для исчезнувших объектов (которых уже нет в ct.objects)
+        alive_ids = set(objects.keys())
+        for oid in list(self.kalmans.keys()):
+            if oid not in alive_ids:
+                del self.kalmans[oid]
 
+        for (objectID, centroid) in objects.items():
+            # init kalman
+            if objectID not in self.kalmans:
+                self.kalmans[objectID] = make_kalman_xy(float(centroid[0]), float(centroid[1]),
+                                                        q=self.kalman_q, r=self.kalman_r)
+
+            # meas_valid только если rects свежие и объект реально обновился (disappeared==0)
+            meas_valid = bool(inputs_fresh) and (self.ct.disappeared.get(objectID, 0) == 0)
+
+            fcx, fcy = kalman_step(self.kalmans[objectID], (int(centroid[0]), int(centroid[1])), meas_valid)
+
+            to = self.trackableObjects.get(objectID, None)
             if to is None:
-                to = TrackableObject(objectID, centroid)
+                to = TrackableObject(objectID, (fcx, fcy))
             else:
-                to.centroids.append(centroid)
+                to.centroids.append((fcx, fcy))
 
                 # пересечение линии по факту (между prev и curr)
                 if not to.counted and len(to.centroids) >= 2:
@@ -342,8 +412,8 @@ class PeopleCounter:
             self.trackableObjects[objectID] = to
 
             if debug and frame is not None:
-                cv2.circle(frame, (centroid[0], centroid[1]), 4, (255, 255, 255), -1)
-                cv2.putText(frame, f"{objectID}", (centroid[0], centroid[1]),
+                cv2.circle(frame, (fcx, fcy), 4, (255, 255, 255), -1)
+                cv2.putText(frame, f"{objectID}", (fcx, fcy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         t1 = time.perf_counter()
@@ -353,7 +423,7 @@ class PeopleCounter:
 # -----------------------------
 # Main
 # -----------------------------
-def main():
+def main() -> float:
     args = parse_args()
     config = load_config()
 
@@ -369,7 +439,7 @@ def main():
 
     resizer = FrameResizer(target_w=320)
     tracker_mgr = KCFTrackerManager()
-    counter = PeopleCounter(maxDisappeared=90, maxDistance=100)
+    counter = PeopleCounter(maxDisappeared=90, maxDistance=100, kalman_q=args.kalman_q, kalman_r=args.kalman_r)
 
     fps = FPS().start()
 
@@ -394,7 +464,7 @@ def main():
 
             # ---- RESIZE ----
             t0 = time.perf_counter()
-            frame = resizer.apply(frame)
+            frame = resizer.apply(frame)  # width=320, height=H'
             if W is None or H is None:
                 (H, W) = frame.shape[:2]
             t1 = time.perf_counter()
@@ -405,7 +475,12 @@ def main():
             prep_ms = infer_ms = post_ms = kcf_ms = 0.0
             rects: List[Tuple[int, int, int, int]] = []
 
+            # inputs_fresh: важно для Kalman
+            inputs_fresh = False
+
             if is_det:
+                inputs_fresh = True
+
                 # DETECT
                 prep_ms = detector.preprocess(frame)
                 results, infer_ms = detector.infer()
@@ -415,13 +490,20 @@ def main():
                     nms_topk=args.nms_topk
                 )
                 tracker_mgr.reset_from_detections(frame, rects)
+
             else:
                 # TRACK
                 do_update = (totalFrames % args.kcf_step == 0)
+                inputs_fresh = do_update  # если не апдейтим — rects старые
+
                 rects, kcf_ms = tracker_mgr.update(frame, do_update=do_update)
 
-            # ---- COUNT ----
-            ct_ms, _objects = counter.update(rects, H=H, W=W, debug=args.debug, frame=frame)
+            # ---- COUNT (+Kalman) ----
+            ct_ms, _objects = counter.update(
+                rects, H=H, W=W,
+                inputs_fresh=inputs_fresh,
+                debug=args.debug, frame=frame
+            )
 
             # ---- DRAW ----
             draw_ms = 0.0
@@ -430,7 +512,7 @@ def main():
                 cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
                 cv2.putText(frame, f"In: {counter.totalDown} Out: {counter.totalUp}", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.imshow("OpenVINO INT8 + KCF (sync, refactored)", frame)
+                cv2.imshow("OpenVINO INT8 + KCF (sync, refactored + kalman)", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 t1 = time.perf_counter()
@@ -462,17 +544,18 @@ def main():
         print(f"[INFO] Итого IN: {counter.totalDown}")
         print(f"[INFO] Итого OUT: {counter.totalUp}")
         print(f"[INFO] Средний FPS: {fps.fps():.2f}")
-        return fps.fps()
 
         if args.bench:
             print(bench.report_all(prefix="[BENCH FINAL ALL]"))
             print(bench.report_det(prefix="[BENCH FINAL DET]"))
             print(bench.report_trk(prefix="[BENCH FINAL TRK]"))
 
+    return fps.fps()
+
 
 if __name__ == "__main__":
-    fpss = np.array([])
-    for i in range(20):
-        fpss = np.append(fpss, main())
+    fpss = []
+    for _ in range(10):
+        fpss.append(main())
+    fpss = np.asarray(fpss, dtype=np.float32)
     print(f"Mean fps: {fpss.mean():.2f}")
-    
