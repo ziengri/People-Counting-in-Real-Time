@@ -1,5 +1,6 @@
 # import the necessary packages
 from scipy.spatial import distance as dist
+from scipy.optimize import linear_sum_assignment
 from collections import OrderedDict
 import numpy as np
 
@@ -76,12 +77,13 @@ class CentroidTracker:
 			# indexes based on their minimum values so that the row
 			# with the smallest value as at the *front* of the index
 			# list
-			rows = D.min(axis=1).argsort()
+			# rows = D.min(axis=1).argsort()
 
 			# next, we perform a similar process on the columns by
 			# finding the smallest value in each column and then
 			# sorting using the previously computed row index list
-			cols = D.argmin(axis=1)[rows]
+			# cols = D.argmin(axis=1)[rows]
+			rows, cols = linear_sum_assignment(D)
 
 			# in order to determine if we need to update, register,
 			# or deregister an object we need to keep track of which

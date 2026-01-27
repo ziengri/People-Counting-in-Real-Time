@@ -74,13 +74,18 @@ def people_counter():
     ap.add_argument("-c", "--confidence", type=float, default=0.3)
     ap.add_argument("-s", "--skip-frames", type=int, default=20)
     ap.add_argument("-d", "--debug", type=int, default=0)
-    ap.add_argument("--kcf-step", type=int, default=1, help="update KCF every N frames (1=each frame)")
+
+    ap.add_argument("--kcf-step", type=int, default=2, help="update KCF every N frames (1=each frame)")
+    ap.add_argument("--nms-topk", type=int, default=200, help="limit candidates before NMS (0=off)")
+
+    ap.add_argument("--realtime", action="store_true", help="throttle file input to real-time fps (needed for async)")
+    ap.add_argument("--realtime-fps", type=float, default=0.0, help="override source fps (0=use CAP_PROP_FPS)")
+
 
     # Benchmark options
     ap.add_argument("--bench", action="store_true", help="enable benchmark timings")
     ap.add_argument("--bench-warmup", type=int, default=50, help="warmup frames before printing benchmark")
     ap.add_argument("--bench-every", type=int, default=200, help="print benchmark every N frames after warmup")
-    ap.add_argument("--nms-topk", type=int, default=200, help="limit candidates before NMS (0=off)")
 
     args = vars(ap.parse_args())
 
@@ -88,7 +93,11 @@ def people_counter():
     core = ov.Core()
     model_ov = core.read_model(model=args["model"])
     compiled_model = core.compile_model(model_ov, "CPU")
-    output_layer = compiled_model.output(0)
+
+    input_port = compiled_model.input(0)
+    output_port = compiled_model.output(0)
+
+    infer_request = compiled_model.create_infer_request()
 
     # Video input
     is_file = bool(args.get("input", False))
@@ -100,10 +109,19 @@ def people_counter():
         if not vs.isOpened():
             print(f"[ERROR] Не удалось открыть видео: {args['input']}")
             return
+    src_fps = 0.0
+    if is_file:
+        src_fps = float(vs.get(cv2.CAP_PROP_FPS) or 0.0)
+        if args["realtime_fps"] > 0:
+            src_fps = float(args["realtime_fps"])
+        if src_fps <= 1.0:
+            src_fps = 25.0  # fallback
+        frame_period = 1.0 / src_fps
+        t_stream0 = time.perf_counter()
 
     # Tracker state
     W = H = None
-    new_size = None  # вычисляем 1 раз
+    new_size = None
     ct = CentroidTracker(maxDisappeared=90, maxDistance=100)
     trackers = []
     trackableObjects = {}
@@ -113,9 +131,16 @@ def people_counter():
     fps = FPS().start()
     inp = np.empty((1, 3, 320, 320), dtype=np.float32)
 
-    # чтобы при kcf-step>1 не передавать пустые rects в CentroidTracker
+    # чтобы при kcf-step>1 не передавать пустые rects
     last_rects = []
 
+    # async state
+    inflight = False
+    inflight_t0 = 0.0
+    inflight_W = inflight_H = None
+    inflight_frame_for_init = None  # кадр, на котором запускаем детект (для init трекеров)
+
+    # bench
     bench = Bench()
     warmup = args["bench_warmup"]
     every = args["bench_every"]
@@ -146,52 +171,67 @@ def people_counter():
         t1 = time.perf_counter()
         resize_ms = (t1 - t0) * 1000.0
 
-        rects = []
-        is_det = (totalFrames % args["skip_frames"] == 0)
-
+        # per-frame stage times
         prep_ms = infer_ms = post_ms = kcf_ms = 0.0
+        rects = []
+        det_completed_this_frame = False
 
-        if is_det:
-            trackers = []
-
-            # ---- PREP ----
+        # ---- START ASYNC DETECTION on schedule (if not inflight) ----
+        if (totalFrames % args["skip_frames"] == 0) and (not inflight):
             t0 = time.perf_counter()
+
             img = cv2.resize(frame, (320, 320), interpolation=cv2.INTER_LINEAR)
             img = img.transpose(2, 0, 1)
             inp[0] = img.astype(np.float32) * (1.0 / 255.0)
+
+            # set tensor and start async
+            infer_request.set_tensor(input_port, ov.Tensor(inp))
+            infer_request.start_async()
+
+            inflight = True
+            inflight_t0 = time.perf_counter()
+            inflight_W, inflight_H = W, H
+
+            # сохраняем кадр для init трекеров (он маленький, копия дешёвая)
+            inflight_frame_for_init = frame.copy()
+
             t1 = time.perf_counter()
             prep_ms = (t1 - t0) * 1000.0
 
-            # ---- INFER ----
-            t0 = time.perf_counter()
-            results = compiled_model([inp])[output_layer]
-            t1 = time.perf_counter()
-            infer_ms = (t1 - t0) * 1000.0
+        # ---- CHECK ASYNC COMPLETION ----
+        if inflight and infer_request.wait_for(0):
+            # infer time = from start_async moment to completion
+            t_done = time.perf_counter()
+            infer_ms = (t_done - inflight_t0) * 1000.0
 
-            # ---- POST (vectorized filter + top-k, minimal python work) ----
+            # get output tensor
+            results = infer_request.get_tensor(output_port).data  # numpy view/copy depending on runtime
+
+            # ---- POST (vectorized) ----
             t0 = time.perf_counter()
-            outputs = np.squeeze(results).T  # (2100, 84)
+
+            outputs = np.squeeze(results).T  # (2100, 84) expected
 
             conf_th = args["confidence"]
-            sx = (W / 320.0)
-            sy = (H / 320.0)
+            sx = (inflight_W / 320.0)
+            sy = (inflight_H / 320.0)
 
-            # 1) векторно фильтруем по confidence
             conf = outputs[:, 4]
             mask = conf > conf_th
+
+            boxes = []
+            confs = []
 
             if np.any(mask):
                 cand = outputs[mask]
                 cand_conf = conf[mask]
 
-                # 2) top-k до NMS (теперь реально помогает, потому что мы не бегаем по всем outputs)
                 k = args["nms_topk"]
                 if k and cand.shape[0] > k:
                     idx = np.argpartition(cand_conf, -k)[-k:]
                     cand = cand[idx]
                     cand_conf = cand_conf[idx]
 
-                # 3) векторно считаем boxes
                 xc = cand[:, 0]
                 yc = cand[:, 1]
                 w = cand[:, 2]
@@ -207,42 +247,48 @@ def people_counter():
 
                 indices = cv2.dnn.NMSBoxes(boxes, confs, conf_th, 0.45)
             else:
-                boxes, confs = [], []
                 indices = []
 
-            # создаём трекеры и rects
+            # rebuild trackers from detection result
+            trackers = []
             rects = []
+
+            init_frame = inflight_frame_for_init if inflight_frame_for_init is not None else frame
+
             if len(indices) > 0:
                 for i in indices.flatten():
                     (x, y, w, h) = boxes[i]
                     rects.append((x, y, x + w, y + h))
 
                     try:
-                        tracker = cv2.TrackerKCF_create()  # или cv2.legacy.TrackerCSRT_create()
+                        tracker = cv2.TrackerKCF_create()
                     except AttributeError:
-                        cv2.legacy.TrackerKCF_create()
-                    tracker.init(frame, (x, y, w, h))
+                        tracker = cv2.legacy.TrackerKCF_create()
+                    tracker.init(init_frame, (x, y, w, h))
                     trackers.append(tracker)
 
-            # сохраняем rects, чтобы использовать на кадрах без KCF update
             last_rects = rects
 
             t1 = time.perf_counter()
             post_ms = (t1 - t0) * 1000.0
 
-        else:
+            # clear inflight
+            inflight = False
+            inflight_frame_for_init = None
+            det_completed_this_frame = True
+
+        # ---- TRACKING (only if we didn't just apply detection this frame) ----
+        if not det_completed_this_frame:
             if (totalFrames % args["kcf_step"]) == 0:
-                # ---- KCF UPDATE ----
                 t0 = time.perf_counter()
                 rects = []
                 for tracker in trackers:
-                    (success, box) = tracker.update(frame)
+                    success, box = tracker.update(frame)
                     if success:
-                        (x, y, w, h) = [int(v) for v in box]
+                        x, y, w, h = [int(v) for v in box]
                         rects.append((x, y, x + w, y + h))
                 t1 = time.perf_counter()
                 kcf_ms = (t1 - t0) * 1000.0
-
                 last_rects = rects
             else:
                 rects = last_rects
@@ -250,38 +296,26 @@ def people_counter():
         # ---- CentroidTracker + counting ----
         t0 = time.perf_counter()
         objects = ct.update(rects)
-        line_y = H // 2
-
         for (objectID, centroid) in objects.items():
             to = trackableObjects.get(objectID, None)
-
             if to is None:
                 to = TrackableObject(objectID, centroid)
             else:
-                # добавляем текущий центроид
+                y_coords = [c[1] for c in to.centroids]
+                direction = centroid[1] - np.mean(y_coords)
                 to.centroids.append(centroid)
 
-                # считаем по факту пересечения линии (между предыдущим и текущим y)
-                if not to.counted and len(to.centroids) >= 2:
-                    prev_y = to.centroids[-2][1]
-                    curr_y = to.centroids[-1][1]
-
-                    # пересёк вниз
-                    if prev_y < line_y <= curr_y:
-                        totalDown += 1
-                        to.counted = True
-                    # пересёк вверх
-                    elif prev_y > line_y >= curr_y:
+                if not to.counted:
+                    if direction < 0 and centroid[1] < H // 2 and len(to.centroids) > 10:
                         totalUp += 1
+                        to.counted = True
+                    elif direction > 0 and centroid[1] > H // 2 and len(to.centroids) > 10:
+                        totalDown += 1
                         to.counted = True
 
             trackableObjects[objectID] = to
-
             if args["debug"]:
                 cv2.circle(frame, (centroid[0], centroid[1]), 4, (255, 255, 255), -1)
-                cv2.putText(frame, f"{objectID}", (centroid[0], centroid[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
         t1 = time.perf_counter()
         ct_ms = (t1 - t0) * 1000.0
 
@@ -292,21 +326,28 @@ def people_counter():
             cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
             cv2.putText(frame, f"In: {totalDown} Out: {totalUp}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.imshow("OpenVINO INT8 + KCF", frame)
+            cv2.imshow("OpenVINO INT8 + KCF (async)", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
             t1 = time.perf_counter()
             draw_ms = (t1 - t0) * 1000.0
 
+        if is_file and args["realtime"]:
+            target = t_stream0 + (totalFrames + 1) * frame_period
+            now = time.perf_counter()
+            dt = target - now
+            if dt > 0:
+                time.sleep(dt)
         totalFrames += 1
         fps.update()
 
         t_total1 = time.perf_counter()
         total_ms = (t_total1 - t_total0) * 1000.0
 
+        # For benchmark: treat "det" as frames where detection finished (not where it was scheduled)
         if args["bench"]:
             bench.add(
-                is_det,
+                det_completed_this_frame,
                 read=read_ms,
                 resize=resize_ms,
                 prep=prep_ms,

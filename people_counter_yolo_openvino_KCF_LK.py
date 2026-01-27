@@ -67,6 +67,54 @@ class Bench:
         return f"{prefix} n={self.trk_n} | " + self._fmt(avg)
 
 
+def clamp_bbox_xywh(x, y, w, h, W, H):
+    x = int(max(0, min(x, W - 1)))
+    y = int(max(0, min(y, H - 1)))
+    w = int(max(1, min(w, W - x)))
+    h = int(max(1, min(h, H - y)))
+    return x, y, w, h
+
+
+def bbox_center_xywh(x, y, w, h):
+    return (x + w * 0.5, y + h * 0.5)
+
+
+def seed_points(gray, x, y, w, h, max_pts=8):
+    """
+    Пытаемся взять текстурные точки внутри bbox через goodFeaturesToTrack.
+    Если не получилось — fallback на "сетку" из 4 точек.
+    """
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    H, W = gray.shape[:2]
+    x, y, w, h = clamp_bbox_xywh(x, y, w, h, W, H)
+
+    roi = gray[y:y + h, x:x + w]
+    pts = None
+    if roi.size > 0 and w >= 8 and h >= 8:
+        # maxCorners = max_pts, качество/дистанция подобраны "в среднем"
+        pts = cv2.goodFeaturesToTrack(
+            roi,
+            maxCorners=max_pts,
+            qualityLevel=0.01,
+            minDistance=max(2, min(w, h) // 6),
+            blockSize=3,
+            useHarrisDetector=False
+        )
+        if pts is not None:
+            pts = pts.reshape(-1, 2)
+            pts[:, 0] += x
+            pts[:, 1] += y
+            pts = pts.reshape(-1, 1, 2).astype(np.float32)
+
+    if pts is None or len(pts) == 0:
+        # fallback: 4 точки сеткой
+        xs = [x + 0.3 * w, x + 0.7 * w, x + 0.3 * w, x + 0.7 * w]
+        ys = [y + 0.3 * h, y + 0.3 * h, y + 0.7 * h, y + 0.7 * h]
+        pts = np.array(list(zip(xs, ys)), dtype=np.float32).reshape(-1, 1, 2)
+
+    return pts
+
+
 def people_counter():
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True, help="path to YOLO12 OpenVINO .xml file")
@@ -74,7 +122,15 @@ def people_counter():
     ap.add_argument("-c", "--confidence", type=float, default=0.3)
     ap.add_argument("-s", "--skip-frames", type=int, default=20)
     ap.add_argument("-d", "--debug", type=int, default=0)
-    ap.add_argument("--kcf-step", type=int, default=1, help="update KCF every N frames (1=each frame)")
+    ap.add_argument("--kcf-step", type=int, default=2, help="update KCF every N frames (1=each frame)")
+
+    # LK options
+    ap.add_argument("--lk", action="store_true", help="enable Lucas-Kanade refinement for bboxes/centroids")
+    ap.add_argument("--lk-points", type=int, default=8, help="number of points per bbox for LK (4-12 typical)")
+    ap.add_argument("--lk-win", type=int, default=21, help="LK window size")
+    ap.add_argument("--lk-maxlevel", type=int, default=3, help="LK pyramid maxLevel")
+    ap.add_argument("--lk-stuck-th", type=float, default=1.0,
+                    help="if KCF moves less than this (px) but LK suggests movement -> use LK shift")
 
     # Benchmark options
     ap.add_argument("--bench", action="store_true", help="enable benchmark timings")
@@ -103,9 +159,13 @@ def people_counter():
 
     # Tracker state
     W = H = None
-    new_size = None  # вычисляем 1 раз
+    new_size = None
     ct = CentroidTracker(maxDisappeared=90, maxDistance=100)
-    trackers = []
+
+    trackers = []            # список KCF объектов
+    track_boxes = []         # список bbox (x,y,w,h) для каждого tracker
+    lk_pts_list = []         # список точек (Nx1x2) для LK по каждому tracker
+
     trackableObjects = {}
     totalFrames = 0
     totalDown = totalUp = 0
@@ -113,12 +173,21 @@ def people_counter():
     fps = FPS().start()
     inp = np.empty((1, 3, 320, 320), dtype=np.float32)
 
-    # чтобы при kcf-step>1 не передавать пустые rects в CentroidTracker
     last_rects = []
+    prev_gray = None
 
     bench = Bench()
     warmup = args["bench_warmup"]
     every = args["bench_every"]
+
+    lk_enabled = bool(args["lk"])
+
+    # LK params
+    lk_params = dict(
+        winSize=(args["lk_win"], args["lk_win"]),
+        maxLevel=args["lk_maxlevel"],
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
 
     while True:
         t_total0 = time.perf_counter()
@@ -146,6 +215,11 @@ def people_counter():
         t1 = time.perf_counter()
         resize_ms = (t1 - t0) * 1000.0
 
+        # ---- gray for LK ----
+        gray = None
+        if lk_enabled:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
         rects = []
         is_det = (totalFrames % args["skip_frames"] == 0)
 
@@ -153,6 +227,8 @@ def people_counter():
 
         if is_det:
             trackers = []
+            track_boxes = []
+            lk_pts_list = []
 
             # ---- PREP ----
             t0 = time.perf_counter()
@@ -168,7 +244,7 @@ def people_counter():
             t1 = time.perf_counter()
             infer_ms = (t1 - t0) * 1000.0
 
-            # ---- POST (vectorized filter + top-k, minimal python work) ----
+            # ---- POST (vectorized filter + top-k) ----
             t0 = time.perf_counter()
             outputs = np.squeeze(results).T  # (2100, 84)
 
@@ -176,7 +252,6 @@ def people_counter():
             sx = (W / 320.0)
             sy = (H / 320.0)
 
-            # 1) векторно фильтруем по confidence
             conf = outputs[:, 4]
             mask = conf > conf_th
 
@@ -184,14 +259,12 @@ def people_counter():
                 cand = outputs[mask]
                 cand_conf = conf[mask]
 
-                # 2) top-k до NMS (теперь реально помогает, потому что мы не бегаем по всем outputs)
                 k = args["nms_topk"]
                 if k and cand.shape[0] > k:
                     idx = np.argpartition(cand_conf, -k)[-k:]
                     cand = cand[idx]
                     cand_conf = cand_conf[idx]
 
-                # 3) векторно считаем boxes
                 xc = cand[:, 0]
                 yc = cand[:, 1]
                 w = cand[:, 2]
@@ -210,77 +283,156 @@ def people_counter():
                 boxes, confs = [], []
                 indices = []
 
-            # создаём трекеры и rects
             rects = []
             if len(indices) > 0:
                 for i in indices.flatten():
                     (x, y, w, h) = boxes[i]
+                    x, y, w, h = clamp_bbox_xywh(x, y, w, h, W, H)
+
                     rects.append((x, y, x + w, y + h))
 
+                    # create KCF tracker
                     try:
-                        tracker = cv2.TrackerKCF_create()  # или cv2.legacy.TrackerCSRT_create()
+                        tracker = cv2.TrackerKCF_create()
                     except AttributeError:
-                        cv2.legacy.TrackerKCF_create()
+                        tracker = cv2.legacy.TrackerKCF_create()
                     tracker.init(frame, (x, y, w, h))
                     trackers.append(tracker)
 
-            # сохраняем rects, чтобы использовать на кадрах без KCF update
+                    # store bbox + seed LK points
+                    track_boxes.append((x, y, w, h))
+                    if lk_enabled:
+                        lk_pts_list.append(seed_points(gray, x, y, w, h, max_pts=args["lk_points"]))
+
             last_rects = rects
+
+            # reset LK previous frame on detection (чтобы не было "скачка")
+            if lk_enabled:
+                prev_gray = gray
 
             t1 = time.perf_counter()
             post_ms = (t1 - t0) * 1000.0
 
         else:
-            if (totalFrames % args["kcf_step"]) == 0:
-                # ---- KCF UPDATE ----
-                t0 = time.perf_counter()
-                rects = []
-                for tracker in trackers:
-                    (success, box) = tracker.update(frame)
-                    if success:
-                        (x, y, w, h) = [int(v) for v in box]
-                        rects.append((x, y, x + w, y + h))
-                t1 = time.perf_counter()
-                kcf_ms = (t1 - t0) * 1000.0
+            # ---- TRACKING (KCF + optional LK) ----
+            t0 = time.perf_counter()
 
-                last_rects = rects
-            else:
-                rects = last_rects
+            # 1) LK предлагаемые сдвиги (на каждом кадре, дёшево)
+            lk_suggested = [None] * len(track_boxes)  # (dx,dy) per tracker
+            if lk_enabled and prev_gray is not None and gray is not None and len(track_boxes) > 0:
+                for i, (bbox, p0) in enumerate(zip(track_boxes, lk_pts_list)):
+                    if p0 is None or len(p0) == 0:
+                        lk_suggested[i] = None
+                        continue
+
+                    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, p0, None, **lk_params)
+                    if p1 is None or st is None:
+                        lk_suggested[i] = None
+                        continue
+
+                    st = st.reshape(-1)
+                    good0 = p0[st == 1].reshape(-1, 2)
+                    good1 = p1[st == 1].reshape(-1, 2)
+
+                    if good1.shape[0] < 1:
+                        lk_suggested[i] = None
+                        continue
+
+                    d = good1 - good0
+                    dx, dy = np.median(d, axis=0)
+                    lk_suggested[i] = (float(dx), float(dy))
+
+                    # обновим точки на "новые" хорошие
+                    lk_pts_list[i] = good1.reshape(-1, 1, 2).astype(np.float32)
+
+            # 2) KCF update по расписанию
+            do_kcf = ((totalFrames % args["kcf_step"]) == 0)
+
+            new_boxes = []
+            for i, tracker in enumerate(trackers):
+                x_prev, y_prev, w_prev, h_prev = track_boxes[i]
+                cx_prev, cy_prev = bbox_center_xywh(x_prev, y_prev, w_prev, h_prev)
+
+                # базово: если KCF не делаем - применяем LK (если есть), иначе оставляем как было
+                x_use, y_use, w_use, h_use = x_prev, y_prev, w_prev, h_prev
+
+                # LK candidate
+                if lk_suggested[i] is not None:
+                    dx, dy = lk_suggested[i]
+                    x_lk = x_prev + dx
+                    y_lk = y_prev + dy
+                    x_lk, y_lk, w_lk, h_lk = clamp_bbox_xywh(x_lk, y_lk, w_prev, h_prev, W, H)
+                else:
+                    x_lk, y_lk, w_lk, h_lk = x_prev, y_prev, w_prev, h_prev
+
+                if do_kcf:
+                    success, box = tracker.update(frame)
+                    if success:
+                        xk, yk, wk, hk = [int(v) for v in box]
+                        xk, yk, wk, hk = clamp_bbox_xywh(xk, yk, wk, hk, W, H)
+                        cx_k, cy_k = bbox_center_xywh(xk, yk, wk, hk)
+                        move_kcf = ((cx_k - cx_prev) ** 2 + (cy_k - cy_prev) ** 2) ** 0.5
+
+                        # если KCF почти не двинулся, но LK даёт сдвиг — берем LK (помогает при "залипании")
+                        if lk_enabled and lk_suggested[i] is not None:
+                            dx, dy = lk_suggested[i]
+                            move_lk = (dx * dx + dy * dy) ** 0.5
+                            if move_kcf < args["lk_stuck_th"] and move_lk > args["lk_stuck_th"]:
+                                x_use, y_use, w_use, h_use = x_lk, y_lk, w_lk, h_lk
+                            else:
+                                x_use, y_use, w_use, h_use = xk, yk, wk, hk
+                        else:
+                            x_use, y_use, w_use, h_use = xk, yk, wk, hk
+                    else:
+                        # KCF не смог — fallback на LK/prev
+                        x_use, y_use, w_use, h_use = x_lk, y_lk, w_lk, h_lk
+                else:
+                    # между KCF-апдейтами используем LK (если есть)
+                    x_use, y_use, w_use, h_use = x_lk, y_lk, w_lk, h_lk
+
+                new_boxes.append((int(x_use), int(y_use), int(w_use), int(h_use)))
+
+            track_boxes = new_boxes
+
+            # 3) reseed LK points внутри текущих bbox (чтобы точки не уехали за границы)
+            if lk_enabled and gray is not None:
+                lk_pts_list = [
+                    seed_points(gray, x, y, w, h, max_pts=args["lk_points"])
+                    for (x, y, w, h) in track_boxes
+                ]
+                prev_gray = gray
+
+            # 4) rects для CentroidTracker
+            rects = [(x, y, x + w, y + h) for (x, y, w, h) in track_boxes]
+            last_rects = rects
+
+            t1 = time.perf_counter()
+            # складываем всё трекинговое время сюда (KCF+LK)
+            kcf_ms = (t1 - t0) * 1000.0
 
         # ---- CentroidTracker + counting ----
         t0 = time.perf_counter()
         objects = ct.update(rects)
-        line_y = H // 2
-
         for (objectID, centroid) in objects.items():
             to = trackableObjects.get(objectID, None)
-
             if to is None:
                 to = TrackableObject(objectID, centroid)
             else:
-                # добавляем текущий центроид
+                y_coords = [c[1] for c in to.centroids]
+                direction = centroid[1] - np.mean(y_coords)
                 to.centroids.append(centroid)
 
-                # считаем по факту пересечения линии (между предыдущим и текущим y)
-                if not to.counted and len(to.centroids) >= 2:
-                    prev_y = to.centroids[-2][1]
-                    curr_y = to.centroids[-1][1]
-
-                    # пересёк вниз
-                    if prev_y < line_y <= curr_y:
-                        totalDown += 1
-                        to.counted = True
-                    # пересёк вверх
-                    elif prev_y > line_y >= curr_y:
+                if not to.counted:
+                    if direction < 0 and centroid[1] < H // 2 and len(to.centroids) > 10:
                         totalUp += 1
+                        to.counted = True
+                    elif direction > 0 and centroid[1] > H // 2 and len(to.centroids) > 10:
+                        totalDown += 1
                         to.counted = True
 
             trackableObjects[objectID] = to
-
             if args["debug"]:
                 cv2.circle(frame, (centroid[0], centroid[1]), 4, (255, 255, 255), -1)
-                cv2.putText(frame, f"{objectID}", (centroid[0], centroid[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         t1 = time.perf_counter()
         ct_ms = (t1 - t0) * 1000.0
@@ -292,7 +444,7 @@ def people_counter():
             cv2.line(frame, (0, H // 2), (W, H // 2), (0, 255, 255), 2)
             cv2.putText(frame, f"In: {totalDown} Out: {totalUp}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.imshow("OpenVINO INT8 + KCF", frame)
+            cv2.imshow("OpenVINO INT8 + KCF + LK", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
             t1 = time.perf_counter()
@@ -312,7 +464,7 @@ def people_counter():
                 prep=prep_ms,
                 infer=infer_ms,
                 post=post_ms,
-                kcf=kcf_ms,
+                kcf=kcf_ms,   # тут KCF+LK вместе
                 ct=ct_ms,
                 draw=draw_ms,
                 total=total_ms,
