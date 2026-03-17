@@ -6,10 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "imutils>=0.5.4",
-    "lz4>=4.4.4",
     "norfair>=2.1.1",
     "norfair-rs>=0.4.1",
     "numpy>=1.24.3",
     "opencv-python>=4.13.0.92",
     "openvino>=2025.4.1",
+    "zstandard>=0.23.0",
 ]

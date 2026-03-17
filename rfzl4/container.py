@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator
 
-import lz4.block
 import numpy as np
+import zstandard as zstd
 
-MAGIC = b"RFL4"
+MAGIC = b"RFZS"
 CHUNK_MAGIC = b"CHK1"
 FORMAT_VERSION = 1
 
@@ -142,7 +142,7 @@ def read_file_header(path: str | Path) -> FileHeader:
     return FileHeader.unpack(data)
 
 
-class RawLZ4FrameWriter:
+class RawZstdFrameWriter:
     def __init__(
         self,
         path: str | Path,
@@ -150,7 +150,8 @@ class RawLZ4FrameWriter:
         height: int = 256,
         channels: int = 3,
         fps: int = 25,
-        chunk_frames: int = 128,
+        chunk_frames: int = 64,
+        zstd_level: int = 3,
     ):
         if width <= 0 or height <= 0 or channels <= 0:
             raise ValueError("width, height and channels must be positive")
@@ -166,8 +167,10 @@ class RawLZ4FrameWriter:
         self.channels = int(channels)
         self.fps = int(fps)
         self.chunk_frames = int(chunk_frames)
+        self.zstd_level = int(zstd_level)
         self.frame_size = self.width * self.height * self.channels
         self.session_start_ns = time.time_ns()
+        self._compressor = zstd.ZstdCompressor(level=self.zstd_level)
 
         self._flags = FLAG_TIMESTAMPS_PRESENT
         self._total_frames = 0
@@ -235,7 +238,7 @@ class RawLZ4FrameWriter:
         timestamps_blob = timestamps.tobytes(order="C")
         frames_blob = b"".join(self._buffer_frames)
         payload = timestamps_blob + frames_blob
-        compressed = lz4.block.compress(payload, store_size=False)
+        compressed = self._compressor.compress(payload)
 
         chunk_header = ChunkHeader(
             chunk_magic=CHUNK_MAGIC,
@@ -275,7 +278,7 @@ class RawLZ4FrameWriter:
         self._closed = True
         return str(self.final_path)
 
-    def __enter__(self) -> "RawLZ4FrameWriter":
+    def __enter__(self) -> "RawZstdFrameWriter":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -283,7 +286,7 @@ class RawLZ4FrameWriter:
             self.close()
 
 
-class RawLZ4FrameReader:
+class RawZstdFrameReader:
     def __init__(self, path: str | Path, skip_corrupted: bool = True):
         self.path = Path(path)
         self.skip_corrupted = bool(skip_corrupted)
@@ -291,6 +294,7 @@ class RawLZ4FrameReader:
         header_data = self._fh.read(FILE_HEADER_SIZE)
         self.file_header = FileHeader.unpack(header_data)
         self._validate_header(self.file_header)
+        self._decompressor = zstd.ZstdDecompressor()
 
         self.width = self.file_header.width
         self.height = self.file_header.height
@@ -349,7 +353,7 @@ class RawLZ4FrameReader:
             expected_payload_size = expected_timestamps_size + expected_raw_size
 
             try:
-                payload = lz4.block.decompress(compressed, uncompressed_size=expected_payload_size)
+                payload = self._decompressor.decompress(compressed, max_output_size=expected_payload_size)
             except Exception as exc:  # noqa: BLE001
                 if self.skip_corrupted:
                     continue
@@ -384,7 +388,7 @@ class RawLZ4FrameReader:
     def close(self) -> None:
         self._fh.close()
 
-    def __enter__(self) -> "RawLZ4FrameReader":
+    def __enter__(self) -> "RawZstdFrameReader":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

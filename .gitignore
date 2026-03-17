@@ -5,9 +5,16 @@ __pycache__/
 
 # C extensions
 *.so
+<<<<<<< HEAD
 *.mkv
 *.rfzst
 *lz4*
+=======
+
+*.rfzst
+*.mkv
+
+>>>>>>> 84b77df (Add zstd)
 # Distribution / packaging
 .Python
 build/

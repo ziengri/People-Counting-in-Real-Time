@@ -11,8 +11,8 @@ from rfzl4 import (
     CHUNK_HEADER_SIZE,
     FILE_HEADER_SIZE,
     FLAG_TIMESTAMPS_PRESENT,
-    RawLZ4FrameReader,
-    RawLZ4FrameWriter,
+    RawZstdFrameReader,
+    RawZstdFrameWriter,
     RFZL4CorruptionError,
     RFZL4FormatError,
     read_file_header,
@@ -44,8 +44,8 @@ def test_header_binary_sizes_are_fixed() -> None:
 
 
 def test_roundtrip_and_partial_last_chunk(tmp_path: Path) -> None:
-    path = tmp_path / "session.rfzl4"
-    writer = RawLZ4FrameWriter(path, chunk_frames=64)
+    path = tmp_path / "session.rfzst"
+    writer = RawZstdFrameWriter(path, chunk_frames=64)
 
     src_frames: list[np.ndarray] = []
     src_ts: list[int] = []
@@ -57,7 +57,7 @@ def test_roundtrip_and_partial_last_chunk(tmp_path: Path) -> None:
         writer.write_frame(frame, ts)
 
     final_path = writer.close()
-    assert final_path.endswith(".rfzl4")
+    assert final_path.endswith(".rfzst")
     assert Path(final_path).exists()
     assert not Path(f"{final_path}.tmp").exists()
 
@@ -70,7 +70,7 @@ def test_roundtrip_and_partial_last_chunk(tmp_path: Path) -> None:
     assert header.frame_size == 256 * 256 * 3
 
     dst: list[tuple[int, np.ndarray]] = []
-    with RawLZ4FrameReader(path) as reader:
+    with RawZstdFrameReader(path) as reader:
         for item in reader:
             dst.append(item)
 
@@ -83,7 +83,7 @@ def test_roundtrip_and_partial_last_chunk(tmp_path: Path) -> None:
 
 
 def test_non_finalized_tmp_file_is_rejected(tmp_path: Path) -> None:
-    tmp_file = tmp_path / "incomplete.rfzl4.tmp"
+    tmp_file = tmp_path / "incomplete.rfzst.tmp"
     header = FileHeader(
         magic=MAGIC,
         version=FORMAT_VERSION,
@@ -107,12 +107,12 @@ def test_non_finalized_tmp_file_is_rejected(tmp_path: Path) -> None:
     tmp_file.write_bytes(header.pack())
 
     with pytest.raises(RFZL4FormatError):
-        RawLZ4FrameReader(tmp_file)
+        RawZstdFrameReader(tmp_file)
 
 
 def test_corrupted_chunk_skip_vs_strict(tmp_path: Path) -> None:
-    path = tmp_path / "corrupted.rfzl4"
-    writer = RawLZ4FrameWriter(path, chunk_frames=64)
+    path = tmp_path / "corrupted.rfzst"
+    writer = RawZstdFrameWriter(path, chunk_frames=64)
     for i in range(130):
         writer.write_frame(_make_frame(i), 2_000_000_000 + i)
     writer.close()
@@ -125,10 +125,10 @@ def test_corrupted_chunk_skip_vs_strict(tmp_path: Path) -> None:
         fh.seek(FILE_HEADER_SIZE)
         fh.write(corrupted.pack())
 
-    with RawLZ4FrameReader(path, skip_corrupted=True) as reader:
+    with RawZstdFrameReader(path, skip_corrupted=True) as reader:
         frames_skip = list(reader)
     assert len(frames_skip) == 66
 
     with pytest.raises(RFZL4CorruptionError):
-        with RawLZ4FrameReader(path, skip_corrupted=False) as reader:
+        with RawZstdFrameReader(path, skip_corrupted=False) as reader:
             list(reader)

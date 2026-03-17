@@ -6,15 +6,15 @@ import time
 import cv2
 import numpy as np
 
-from rfzl4 import RawLZ4FrameReader
+from rfzl4 import RawZstdFrameReader
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read RFZL4 container sequentially")
-    parser.add_argument("--input", required=True, help="Path to input .rfzl4 file")
+    parser = argparse.ArgumentParser(description="Read RFZST container sequentially")
+    parser.add_argument("--input", required=True, help="Path to input .rfzst file")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (0 = all)")
     parser.add_argument("--strict", action="store_true", help="Fail on corrupted chunks")
-    parser.add_argument("--window-name", default="RFZL4 Player", help="OpenCV window title")
+    parser.add_argument("--window-name", default="RFZST Player", help="OpenCV window title")
     return parser.parse_args()
 
 
@@ -33,7 +33,7 @@ def main() -> int:
     count = 0
 
     try:
-        with RawLZ4FrameReader(args.input, skip_corrupted=not args.strict) as reader:
+        with RawZstdFrameReader(args.input, skip_corrupted=not args.strict) as reader:
             for timestamp_ns, frame in reader:
                 should_continue = process_frame(timestamp_ns, frame, args.window_name)
                 count += 1
@@ -45,7 +45,7 @@ def main() -> int:
         cv2.destroyAllWindows()
 
     elapsed = time.time() - start
-    print(f"[RFZL4] Read {count} frames from {args.input} in {elapsed:.2f}s")
+    print(f"[RFZST] Read {count} frames from {args.input} in {elapsed:.2f}s")
     return 0
 
 
