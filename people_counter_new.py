@@ -15,6 +15,160 @@ from scipy.spatial import distance as dist
 from scipy.optimize import linear_sum_assignment
 
 
+
+# import the necessary packages
+from scipy.spatial import distance as dist
+from scipy.optimize import linear_sum_assignment
+from collections import OrderedDict
+import numpy as np
+
+class CentroidTracker:
+	def __init__(self, maxDisappeared=50, maxDistance=50):
+		# initialize the next unique object ID along with two ordered
+		# dictionaries used to keep track of mapping a given object
+		# ID to its centroid and number of consecutive frames it has
+		# been marked as "disappeared", respectively
+		self.nextObjectID = 0
+		self.objects = OrderedDict()
+		self.disappeared = OrderedDict()
+
+		# store the number of maximum consecutive frames a given
+		# object is allowed to be marked as "disappeared" until we
+		# need to deregister the object from tracking
+		self.maxDisappeared = maxDisappeared
+
+		# store the maximum distance between centroids to associate
+		# an object -- if the distance is larger than this maximum
+		# distance we'll start to mark the object as "disappeared"
+		self.maxDistance = maxDistance
+
+	def register(self, centroid):
+		# when registering an object we use the next available object
+		# ID to store the centroid
+		self.objects[self.nextObjectID] = centroid
+		self.disappeared[self.nextObjectID] = 0
+		self.nextObjectID += 1
+
+	def deregister(self, objectID):
+		# to deregister an object ID we delete the object ID from
+		# both of our respective dictionaries
+		del self.objects[objectID]
+		del self.disappeared[objectID]
+
+	def update(self, rects):
+		# check to see if the list of input bounding box rectangles
+		# is empty
+		if len(rects) == 0:
+				for objectID in list(self.disappeared.keys()):
+					self.disappeared[objectID] += 1
+					if self.disappeared[objectID] > self.maxDisappeared:
+						self.deregister(objectID)
+				return self.objects
+
+		# Быстрое вычисление центроидов через NumPy
+		rects = np.array(rects)
+		inputCentroids = np.zeros((len(rects), 2), dtype="int")
+		inputCentroids[:, 0] = (rects[:, 0] + rects[:, 2]) // 2
+		inputCentroids[:, 1] = (rects[:, 1] + rects[:, 3]) // 2
+		# if we are currently not tracking any objects take the input
+		# centroids and register each of them
+		if len(self.objects) == 0:
+			for i in range(0, len(inputCentroids)):
+				self.register(inputCentroids[i])
+
+		# otherwise, are are currently tracking objects so we need to
+		# try to match the input centroids to existing object
+		# centroids
+		else:
+			# grab the set of object IDs and corresponding centroids
+			objectIDs = list(self.objects.keys())
+			objectCentroids = np.array(list(self.objects.values()))
+
+			# compute the distance between each pair of object
+			# centroids and input centroids, respectively -- our
+			# goal will be to match an input centroid to an existing
+			# object centroid
+			D = dist.cdist(objectCentroids, inputCentroids)
+
+			# in order to perform this matching we must (1) find the
+			# smallest value in each row and then (2) sort the row
+			# indexes based on their minimum values so that the row
+			# with the smallest value as at the *front* of the index
+			# list
+			# rows = D.min(axis=1).argsort()
+
+			# next, we perform a similar process on the columns by
+			# finding the smallest value in each column and then
+			# sorting using the previously computed row index list
+			# cols = D.argmin(axis=1)[rows]
+			rows, cols = linear_sum_assignment(D)
+
+			# in order to determine if we need to update, register,
+			# or deregister an object we need to keep track of which
+			# of the rows and column indexes we have already examined
+			usedRows = set()
+			usedCols = set()
+
+			# loop over the combination of the (row, column) index
+			# tuples
+			for (row, col) in zip(rows, cols):
+				# if we have already examined either the row or
+				# column value before, ignore it
+				if row in usedRows or col in usedCols:
+					continue
+
+				# if the distance between centroids is greater than
+				# the maximum distance, do not associate the two
+				# centroids to the same object
+				if D[row, col] > self.maxDistance:
+					continue
+
+				# otherwise, grab the object ID for the current row,
+				# set its new centroid, and reset the disappeared
+				# counter
+				objectID = objectIDs[row]
+				self.objects[objectID] = inputCentroids[col]
+				self.disappeared[objectID] = 0
+
+				# indicate that we have examined each of the row and
+				# column indexes, respectively
+				usedRows.add(row)
+				usedCols.add(col)
+
+			# compute both the row and column index we have NOT yet
+			# examined
+			unusedRows = set(range(0, D.shape[0])).difference(usedRows)
+			unusedCols = set(range(0, D.shape[1])).difference(usedCols)
+
+			# in the event that the number of object centroids is
+			# equal or greater than the number of input centroids
+			# we need to check and see if some of these objects have
+			# potentially disappeared
+			if D.shape[0] >= D.shape[1]:
+				# loop over the unused row indexes
+				for row in unusedRows:
+					# grab the object ID for the corresponding row
+					# index and increment the disappeared counter
+					objectID = objectIDs[row]
+					self.disappeared[objectID] += 1
+
+					# check to see if the number of consecutive
+					# frames the object has been marked "disappeared"
+					# for warrants deregistering the object
+					if self.disappeared[objectID] > self.maxDisappeared:
+						self.deregister(objectID)
+
+			# otherwise, if the number of input centroids is greater
+			# than the number of existing object centroids we need to
+			# register each new input centroid as a trackable object
+			else:
+				for col in unusedCols:
+					self.register(inputCentroids[col])
+
+		# return the set of trackable objects
+		return self.objects
+
+
 # -----------------------------
 # Benchmark
 # -----------------------------
@@ -264,11 +418,224 @@ class OpenVINODetector:
 # -----------------------------
 # KCF tracker manager
 # -----------------------------
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+import time
+import numpy as np
+import cv2
+
+Rect = Tuple[int, int, int, int]
+
+
 def create_kcf_tracker():
     if hasattr(cv2, "TrackerKCF_create"):
         return cv2.TrackerKCF_create()
     return cv2.legacy.TrackerKCF_create()
 
+
+def iou(a: Rect, b: Rect) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return float(inter) / float(union + 1e-9)
+
+
+@dataclass
+class _Track:
+    tracker: any
+    rect: Rect
+    last_match_frame: int
+    last_update_frame: int
+
+
+class SmartKCFTrackerManager:
+    """
+    Умный менеджер KCF:
+      - трекеры живут между детекциями
+      - на детекции: IoU matching детекций к текущим трекам
+      - совпавшие: реинициализация трекера по bbox детекции
+      - новые детекции: создаём новые трекеры
+      - пропавшие: удаляем после max_missed детекций без матча
+
+    Важно:
+      - matching делаем на кадрах детекции (is_det=True), а не на каждом кадре.
+      - на обычных кадрах просто tracker.update().
+    """
+
+    def __init__(
+        self,
+        iou_th: float = 0.3,
+        max_missed: int = 5,   # сколько "детекций" подряд можно не матчиться
+        min_area: int = 15 * 15,
+    ):
+        self.iou_th = float(iou_th)
+        self.max_missed = int(max_missed)
+        self.min_area = int(min_area)
+
+        self.tracks: Dict[int, _Track] = {}
+        self.next_id = 0
+
+        self.last_rects: List[Rect] = []
+        self.frame_idx = 0
+        self.det_idx = 0  # счётчик детекционных кадров
+
+    def _new_id(self) -> int:
+        tid = self.next_id
+        self.next_id += 1
+        return tid
+
+    @staticmethod
+    def _to_cv_box(r: Rect) -> Tuple[int, int, int, int]:
+        x1, y1, x2, y2 = r
+        return int(x1), int(y1), int(max(1, x2 - x1)), int(max(1, y2 - y1))
+
+    def _valid_rect(self, r: Rect) -> bool:
+        x1, y1, x2, y2 = r
+        w = x2 - x1
+        h = y2 - y1
+        return (w > 0 and h > 0 and (w * h) >= self.min_area)
+
+    def update_trackers(self, frame: np.ndarray, do_update: bool = True) -> Tuple[List[Rect], float]:
+        """
+        Обновление на НЕ-детекционном кадре.
+        """
+        if not do_update:
+            self.frame_idx += 1
+            return self.last_rects, 0.0
+
+        t0 = time.perf_counter()
+
+        rects: List[Rect] = []
+        dead_ids: List[int] = []
+
+        for tid, tr in self.tracks.items():
+            ok, box = tr.tracker.update(frame)
+            if not ok:
+                # трекер не смог обновиться — оставим последний rect,
+                # но можно и пометить как dead (по вкусу).
+                dead_ids.append(tid)
+                continue
+
+            x, y, w, h = [int(v) for v in box]
+            r = (x, y, x + w, y + h)
+            tr.rect = r
+            tr.last_update_frame = self.frame_idx
+            rects.append(r)
+
+        # можно удалять "совсем умершие" трекеры сразу
+        for tid in dead_ids:
+            self.tracks.pop(tid, None)
+
+        self.last_rects = rects
+        self.frame_idx += 1
+
+        t1 = time.perf_counter()
+        return rects, (t1 - t0) * 1000.0
+
+    def apply_detections(self, frame: np.ndarray, det_rects: List[Rect]) -> None:
+        """
+        Вызывается на детекционном кадре (is_det=True).
+        Делает IoU matching детекций к текущим трекам и обновляет трекеры.
+        """
+        self.det_idx += 1
+
+        # отфильтруем мусор
+        det_rects = [r for r in det_rects if self._valid_rect(r)]
+
+        if len(self.tracks) == 0:
+            # создаём треки на все детекции
+            for r in det_rects:
+                tid = self._new_id()
+                trk = create_kcf_tracker()
+                trk.init(frame, self._to_cv_box(r))
+                self.tracks[tid] = _Track(tracker=trk, rect=r,
+                                         last_match_frame=self.det_idx,
+                                         last_update_frame=self.frame_idx)
+            self.last_rects = det_rects
+            return
+
+        track_ids = list(self.tracks.keys())
+        track_rects = [self.tracks[tid].rect for tid in track_ids]
+
+        # IoU матрица [num_tracks, num_dets]
+        if len(det_rects) == 0:
+            # нет детекций: просто увеличиваем "пропуски" через det_idx
+            self._drop_missed_tracks(set())
+            return
+
+        iou_mat = np.zeros((len(track_rects), len(det_rects)), dtype=np.float32)
+        for i, tr in enumerate(track_rects):
+            for j, dr in enumerate(det_rects):
+                iou_mat[i, j] = iou(tr, dr)
+
+        # greedy matching по max IoU (достаточно для 7-13 skip, проще чем Hungarian)
+        matched_tracks = set()
+        matched_dets = set()
+
+        # сортируем пары по IoU убыванию
+        pairs = np.dstack(np.unravel_index(np.argsort(-iou_mat.ravel()), iou_mat.shape))[0]
+        for i, j in pairs:
+            if i in matched_tracks or j in matched_dets:
+                continue
+            if iou_mat[i, j] < self.iou_th:
+                break
+            matched_tracks.add(i)
+            matched_dets.add(j)
+
+            tid = track_ids[i]
+            r = det_rects[j]
+
+            # реинициализация трекера на bbox детекции (жёсткая коррекция)
+            trk = create_kcf_tracker()
+            trk.init(frame, self._to_cv_box(r))
+
+            tr = self.tracks[tid]
+            tr.tracker = trk
+            tr.rect = r
+            tr.last_match_frame = self.det_idx
+            tr.last_update_frame = self.frame_idx
+
+        # новые детекции -> новые треки
+        for j, r in enumerate(det_rects):
+            if j in matched_dets:
+                continue
+            tid = self._new_id()
+            trk = create_kcf_tracker()
+            trk.init(frame, self._to_cv_box(r))
+            self.tracks[tid] = _Track(tracker=trk, rect=r,
+                                     last_match_frame=self.det_idx,
+                                     last_update_frame=self.frame_idx)
+
+        # удаляем треки, которые не матчились давно
+        keep_track_ids = {track_ids[i] for i in matched_tracks}
+        self._drop_missed_tracks(keep_track_ids)
+
+        # last_rects = текущие rect всех треков (после обновления)
+        self.last_rects = [tr.rect for tr in self.tracks.values()]
+
+    def _drop_missed_tracks(self, matched_track_ids: set):
+        # matched_track_ids: реальные tid, которые матчились на этой детекции
+        dead = []
+        for tid, tr in self.tracks.items():
+            missed = self.det_idx - tr.last_match_frame
+            if missed > self.max_missed:
+                dead.append(tid)
+        for tid in dead:
+            self.tracks.pop(tid, None)
 
 class KCFTrackerManager:
     def __init__(self):
@@ -334,10 +701,10 @@ class PeopleCounter:
 
                     if prev_y < line_y <= curr_y:
                         self.totalDown += 1
-                        to.counted = True
+                        # to.counted = True
                     elif prev_y > line_y >= curr_y:
                         self.totalUp += 1
-                        to.counted = True
+                        # to.counted = True
 
             self.trackableObjects[objectID] = to
 
@@ -368,7 +735,7 @@ def main():
         source = StreamVideoSource(config["url"])
 
     resizer = FrameResizer(target_w=320)
-    tracker_mgr = KCFTrackerManager()
+    tracker_mgr = SmartKCFTrackerManager(iou_th=0.3, max_missed=5)
     counter = PeopleCounter(maxDisappeared=90, maxDistance=100)
 
     fps = FPS().start()
@@ -382,6 +749,7 @@ def main():
 
     try:
         while True:
+            # time.sleep(0.05)
             t_total0 = time.perf_counter()
 
             # ---- READ ----
@@ -406,19 +774,18 @@ def main():
             rects: List[Tuple[int, int, int, int]] = []
 
             if is_det:
-                # DETECT
                 prep_ms = detector.preprocess(frame)
                 results, infer_ms = detector.infer()
                 rects, post_ms = detector.postprocess(
-                    results, W=W, H=H,
-                    conf_th=args.confidence,
-                    nms_topk=args.nms_topk
+                    results,
+                    W, H,
+                    args.confidence,
+                    args.nms_topk
                 )
-                tracker_mgr.reset_from_detections(frame, rects)
+                tracker_mgr.apply_detections(frame, rects)
             else:
-                # TRACK
                 do_update = (totalFrames % args.kcf_step == 0)
-                rects, kcf_ms = tracker_mgr.update(frame, do_update=do_update)
+                rects, kcf_ms = tracker_mgr.update_trackers(frame, do_update=do_update)
 
             # ---- COUNT ----
             ct_ms, _objects = counter.update(rects, H=H, W=W, debug=args.debug, frame=frame)
@@ -452,7 +819,10 @@ def main():
                     print(bench.report_all())
                     print(bench.report_det())
                     print(bench.report_trk())
-
+    except Exception as e:
+        print(f"[EXCEPTION] {type(e).__name__}: {e}")
+        traceback.print_exc()
+        raise
     finally:
         fps.stop()
         source.release()
@@ -471,8 +841,9 @@ def main():
 
 
 if __name__ == "__main__":
-    fpss = np.array([])
-    for i in range(20):
-        fpss = np.append(fpss, main())
-    print(f"Mean fps: {fpss.mean():.2f}")
+    main()
+    # fpss = np.array([])
+    # for i in range(20):
+    #     fpss = np.append(fpss, main())
+    # print(f"Mean fps: {fpss.mean():.2f}")
     

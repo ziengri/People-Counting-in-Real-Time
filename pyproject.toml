@@ -1,0 +1,13 @@
+[project]
+name = "people-counting-in-real-time"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "imutils>=0.5.4",
+    "norfair>=2.1.1",
+    "norfair-rs>=0.4.1",
+    "opencv-python>=4.13.0.92",
+    "openvino>=2025.4.1",
+]

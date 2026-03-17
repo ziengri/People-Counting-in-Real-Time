@@ -1,0 +1,62 @@
+
+        *frame = imutils.resize(frame, width=320)
+root@debian:~/Desktop/People-Counting-in-Real-Time# xvfb-run -a python people_co                                                                                                                                                                                                          unter_yolo_openvino_KCF.py   -m detector/yolo12n_int8_openvino_model/yolo12n.xml                                                                                                                                                                                                             --input ./utils/data/tests/test_1.mp4   --skip-frames 20 --confidence 0.3 --d                                                                                                                                                                                                          ebug 0   --bench --bench-warmup 100 --bench-every 200
+[INFO] Загрузка модели OpenVINO...                                                                                                                                                                                                         72 ct=0.30 draw=0.00 total=12.12
+[INFO] Итого IN: 6
+[INFO] Итого OUT: 3
+[INFO] Средний FPS: 54.07
+[BENCH FINAL ALL] n=1283 | read=0.65 resize=4.43 prep=0.16 infer=5.46 post=1.49                                                                                                                                                                                                           kcf=5.97 ct=0.28 draw=0.00 total=18.46
+[BENCH FINAL DET] n=65 | read=0.71 resize=4.42 prep=3.17 infer=107.68 post=29.42                                                                                                                                                                                                           kcf=0.00 ct=0.28 draw=0.00 total=145.72
+[BENCH FINAL TRK] n=1218 | read=0.64 resize=4.43 prep=0.00 infer=0.00 post=0.00                                                                                                                                                                                                           kcf=6.29 ct=0.28 draw=0.00 total=11.67
+
+	*frame = imutils.resize(frame, width=320) заменили на cv.resize
+root@debian:~/Desktop/People-Counting-in-Real-Time# xvfb-run -a python people_counter_yolo_openvino_KCF.py \
+  -m detector/yolo12n_int8_openvino_model/yolo12n.xml \
+  --input ./utils/data/tests/test_1.mp4 \
+  --skip-frames 20 --confidence 0.3 --debug 0 \
+  --bench --bench-warmup 100 --bench-every 200
+[INFO] Загрузка модели OpenVINO...
+[INFO] Итого IN: 6
+[INFO] Итого OUT: 3
+[INFO] Средний FPS: 65.77
+[BENCH FINAL ALL] n=1283 | read=0.66 resize=0.90 prep=0.18 infer=5.38 post=1.50 kcf=6.23 ct=0.28 draw=0.00 total=15.17
+[BENCH FINAL DET] n=65 | read=0.76 resize=0.92 prep=3.47 infer=106.26 post=29.66 kcf=0.00 ct=0.27 draw=0.00 total=141.40
+[BENCH FINAL TRK] n=1218 | read=0.66 resize=0.90 prep=0.00 infer=0.00 post=0.00 kcf=6.56 ct=0.28 draw=0.00 total=8.43
+
+
+*Добавили KFC step что бы обработка трекинга была не каждый кадр
+root@debian:~/Desktop/People-Counting-in-Real-Time# xvfb-run -a python people_counter_yolo_openvino_KCF.py   -m detector/yolo12n_int8_openvino_model/yolo12n.xml   --input ./utils/data/tests/test_1.mp4   --skip-frames 20 --confidence 0.3 --debug 0   --bench --bench-warmup 100 --bench-every 200 --kcf-step=2
+[INFO] Загрузка модели OpenVINO...
+[INFO] Итого IN: 6
+[INFO] Итого OUT: 3
+[INFO] Средний FPS: 84.05
+[BENCH FINAL ALL] n=1283 | read=0.66 resize=0.90 prep=0.19 infer=5.41 post=1.50 kcf=2.92 ct=0.25 draw=0.00 total=11.86
+[BENCH FINAL DET] n=65 | read=0.76 resize=0.91 prep=3.78 infer=106.69 post=29.56 kcf=0.00 ct=0.27 draw=0.00 total=142.03
+[BENCH FINAL TRK] n=1218 | read=0.66 resize=0.90 prep=0.00 infer=0.00 post=0.00 kcf=3.08 ct=0.25 draw=0.00 total=4.92
+
+
+*Добавили nms_topk
+python people_counter_yolo_openvino_KCF.py   -m detector/yolo12n_int8_openvino_model/yolo12n.xml   --input ./utils/data/tests/test_1.mp4   --skip-frames 20 --confidence 0.3 --debug 0   --bench --bench-warmup 100 --bench-every 200 --kcf-step=2 --nms-topk=200
+[INFO] Загрузка модели OpenVINO...
+[INFO] Итого IN: 6
+[INFO] Итого OUT: 3
+[INFO] Средний FPS: 83.90
+[BENCH FINAL ALL] n=1283 | read=0.67 resize=0.90 prep=0.19 infer=5.41 post=1.50 kcf=2.94 ct=0.25 draw=0.00 total=11.88
+[BENCH FINAL DET] n=65 | read=0.71 resize=0.90 prep=3.77 infer=106.87 post=29.53 kcf=0.00 ct=0.27 draw=0.00 total=142.11
+[BENCH FINAL TRK] n=1218 | read=0.66 resize=0.90 prep=0.00 infer=0.00 post=0.00 kcf=3.09 ct=0.25 draw=0.00 total=4.93
+root@debian:~/Desktop/People-Counting-in-Real-Time#
+
+
+*векторизовать фильтрацию, а Python-цикл делать только по top-k
+root@debian:~/Desktop/People-Counting-in-Real-Time# 
+python people_counter_yolo_openvino_KCF.py -m detector/yolo12n_int8_openvino_model/yolo12n.xml --input ./utils/data/tests/test_1.mp4 --skip-frames 20 --confidence 0.3 --debug 0 --bench --bench-warmup 100 --bench-every 200 --kcf-step=2 --nms-topk=200
+[INFO] Загрузка модели OpenVINO...
+[INFO] Итого IN: 6
+[INFO] Итого OUT: 3
+[INFO] Средний FPS: 94.73
+[BENCH FINAL ALL] n=1283 | read=0.65 resize=0.90 prep=0.22 infer=5.37 post=0.12 kcf=2.94 ct=0.29 draw=0.00 total=10.52
+[BENCH FINAL DET] n=65 | read=0.70 resize=0.90 prep=4.24 infer=106.06 post=2.39 kcf=0.00 ct=0.27 draw=0.00 total=114.62
+[BENCH FINAL TRK] n=1218 | read=0.65 resize=0.90 prep=0.00 infer=0.00 post=0.00 kcf=3.10 ct=0.29 draw=0.00 total=4.97
+
+
+python people_counter_new.py -m detector/bus_int8_openvino_model/bus.xml --input test3.mp4 --skip-frames 10 --confidence 0.3 --debug 1 --bench --bench-warmup 100 --bench-every 200 --kcf-step=2 --nms-topk=200
